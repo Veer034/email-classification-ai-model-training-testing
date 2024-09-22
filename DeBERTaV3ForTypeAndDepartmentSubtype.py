@@ -1,23 +1,15 @@
 import torch
-from transformers import (
-    DebertaV2Tokenizer,
-    DebertaV2Model,
-    DebertaV2PreTrainedModel,
-    DebertaV2Config,
-    TrainingArguments,
-    Trainer,
-    EarlyStoppingCallback,
-)
+from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification, TrainingArguments, Trainer
 from datasets import Dataset
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+from transformers import EarlyStoppingCallback
 from google.cloud import storage
 import pandas as pd
 import io
+from collections import defaultdict
 import os
 import pickle
-import torch.nn as nn
-from transformers.trainer_utils import get_last_checkpoint
 
 # Configuration
 bucket_name = 'email_classification_convonest'
@@ -66,41 +58,56 @@ def load_data_from_gcs():
 # Load and preprocess the data
 df = load_data_from_gcs()
 
-# Fit type_encoder on actual data types
-type_encoder = LabelEncoder()
-type_encoder.fit(df['type'])
+# Create department-specific type encoders
+department_type_encoders = {dept: LabelEncoder().fit(df[df['department'] == dept]['type']) for dept in df['department'].unique()}
 
-department_subtype_encoders = {}
-department_subtype_hierarchies = {}
+department_subtype_encoders = defaultdict(LabelEncoder)
+
+class DefaultDict(dict):
+    def __missing__(self, key):
+        self[key] = DefaultDict()
+        return self[key]
+
+    def add(self, item):
+        self[item] = set()
+
+department_subtype_hierarchies = DefaultDict()
 
 # First pass: collect all subtypes for each department and type
 for _, row in df.iterrows():
     dept = row['department']
     type_ = row['type']
     subtype = row['sub_type']
-    if dept not in department_subtype_hierarchies:
-        department_subtype_hierarchies[dept] = {}
-    if type_ not in department_subtype_hierarchies[dept]:
-        department_subtype_hierarchies[dept][type_] = set()
-    department_subtype_hierarchies[dept][type_].add(subtype)
+    if subtype not in department_subtype_hierarchies[dept][type_]:
+        department_subtype_hierarchies[dept][type_].add(subtype)
 
 # Second pass: fit the encoders with all known subtypes
 for dept, type_subtypes in department_subtype_hierarchies.items():
     all_subtypes = set()
     for subtypes in type_subtypes.values():
         all_subtypes.update(subtypes)
-    encoder = LabelEncoder()
-    encoder.fit(list(all_subtypes))
-    department_subtype_encoders[dept] = encoder
+    department_subtype_encoders[dept].fit(list(all_subtypes))
 
 # Encode types and subtypes
-df['type_encoded'] = type_encoder.transform(df['type'])
+def encode_type(row):
+    dept = row['department']
+    type_ = row['type']
+    encoder = department_type_encoders[dept]
+    return encoder.transform([type_])[0]
+
+df['type_encoded'] = df.apply(encode_type, axis=1)
 
 def encode_subtype(row):
     dept = row['department']
     subtype = row['sub_type']
     encoder = department_subtype_encoders[dept]
-    return encoder.transform([subtype])[0]
+    if subtype in encoder.classes_:
+        return encoder.transform([subtype])[0]
+    else:
+        print(f"Warning: Unseen subtype '{subtype}' in department '{dept}'. Assigning a new label.")
+        new_classes = np.append(encoder.classes_, subtype)
+        encoder.classes_ = new_classes
+        return len(encoder.classes_) - 1
 
 df['subtype_encoded'] = df.apply(encode_subtype, axis=1)
 
@@ -123,99 +130,60 @@ def preprocess_function(examples):
 # Tokenize the dataset
 tokenized_dataset = dataset.map(preprocess_function, batched=True, remove_columns=dataset.column_names)
 
-# Split dataset into train and test
+# Split dataset into train and test using Hugging Face's split method
 split_dataset = tokenized_dataset.train_test_split(test_size=0.2, seed=42)
 train_dataset = split_dataset['train']
 eval_dataset = split_dataset['test']
 
-# Custom model class
-class DebertaV3ForTypeAndDepartmentSubtype(DebertaV2PreTrainedModel):
-    def __init__(self, config, num_types, department_subtype_encoders):
+class DebertaV3ForTypeAndDepartmentSubtype(DebertaV2ForSequenceClassification):
+    def __init__(self, config, department_type_encoders, department_subtype_encoders):
         super().__init__(config)
-        self.num_types = num_types
+        self.department_type_encoders = department_type_encoders
         self.department_subtype_encoders = department_subtype_encoders
-        self.max_subtypes = max(len(encoder.classes_) for encoder in department_subtype_encoders.values())
-
-        # Load the base model
-        self.deberta = DebertaV2Model(config)
-
-        # Additional layers
-        self.pooler = nn.Linear(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.type_classifier = nn.Linear(config.hidden_size, self.num_types)
-        self.subtype_classifier = nn.Linear(config.hidden_size, self.max_subtypes)
-        self.init_weights()
+        max_types = max(len(encoder.classes_) for encoder in department_type_encoders.values())
+        max_subtypes = max(len(encoder.classes_) for encoder in department_subtype_encoders.values())
+        
+        self.type_classifier = torch.nn.Linear(config.hidden_size, max_types)
+        self.subtype_classifier = torch.nn.Linear(config.hidden_size, max_subtypes)
 
     def forward(self, input_ids=None, attention_mask=None, department=None, type_labels=None, subtype_labels=None, **kwargs):
-        outputs = self.deberta(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state
-        pooled_output = self.pooler(sequence_output[:, 0])  # Use [CLS] token
-        pooled_output = self.activation(pooled_output)
-        pooled_output = self.dropout(pooled_output)
+        outputs = self.deberta(input_ids, attention_mask=attention_mask)
+        sequence_output = outputs[0]
+        pooled_output = self.pooler(sequence_output)
 
         type_logits = self.type_classifier(pooled_output)
-        all_subtype_logits = self.subtype_classifier(pooled_output)
+        subtype_logits = self.subtype_classifier(pooled_output)
 
         loss = None
         if type_labels is not None and subtype_labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            type_loss = loss_fct(type_logits, type_labels)
-
-            # Compute subtype loss only for valid subtypes
+            loss_fct = torch.nn.CrossEntropyLoss()
+            type_loss = 0
             subtype_loss = 0
             for i, dept in enumerate(department):
-                dept_encoder = self.department_subtype_encoders[dept]
-                valid_subtype_count = len(dept_encoder.classes_)
-                dept_subtype_logits = all_subtype_logits[i, :valid_subtype_count]
-                dept_subtype_label = subtype_labels[i]
-                subtype_loss += loss_fct(dept_subtype_logits.unsqueeze(0), dept_subtype_label.unsqueeze(0))
+                dept_type_encoder = self.department_type_encoders[dept]
+                dept_subtype_encoder = self.department_subtype_encoders[dept]
+                
+                valid_type_count = len(dept_type_encoder.classes_)
+                valid_subtype_count = len(dept_subtype_encoder.classes_)
+                
+                dept_type_logits = type_logits[i, :valid_type_count]
+                dept_subtype_logits = subtype_logits[i, :valid_subtype_count]
+                
+                type_loss += loss_fct(dept_type_logits.unsqueeze(0), type_labels[i].unsqueeze(0))
+                subtype_loss += loss_fct(dept_subtype_logits.unsqueeze(0), subtype_labels[i].unsqueeze(0))
+            
+            type_loss /= len(department)
             subtype_loss /= len(department)
-
             loss = type_loss + subtype_loss
 
-        return (loss, type_logits, all_subtype_logits)
+        return {'loss': loss, 'type_logits': type_logits, 'subtype_logits': subtype_logits}
 
-    def save_pretrained(self, save_directory, **kwargs):
-        # Save the configuration and model weights
-        super().save_pretrained(save_directory, **kwargs)
-
-        # Save department_subtype_encoders
-        encoder_dir = os.path.join(save_directory, 'encoders')
-        os.makedirs(encoder_dir, exist_ok=True)
-        with open(os.path.join(encoder_dir, 'department_subtype_encoders.pkl'), 'wb') as f:
-            pickle.dump(self.department_subtype_encoders, f)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # Load the base model and configuration
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
-        # Load department_subtype_encoders
-        encoder_dir = os.path.join(pretrained_model_name_or_path, 'encoders')
-        with open(os.path.join(encoder_dir, 'department_subtype_encoders.pkl'), 'rb') as f:
-            department_subtype_encoders = pickle.load(f)
-
-        # Set the attribute
-        model.department_subtype_encoders = department_subtype_encoders
-        model.max_subtypes = max(len(encoder.classes_) for encoder in department_subtype_encoders.values())
-
-        # Adjust the subtype classifier
-        model.subtype_classifier = nn.Linear(model.config.hidden_size, model.max_subtypes)
-
-        return model
-
-
-# Calculate num_types
-num_types = len(type_encoder.classes_)
-
-# Load pre-trained DeBERTa-v3-base model configuration
-config = DebertaV2Config.from_pretrained('microsoft/deberta-v3-base')
-config.num_labels = num_types
-config.problem_type = "single_label_classification"
-
-# Initialize the custom model
-model = DebertaV3ForTypeAndDepartmentSubtype(config, num_types=num_types, department_subtype_encoders=department_subtype_encoders)
+# Load pre-trained DeBERTa-v3-base model
+model = DebertaV3ForTypeAndDepartmentSubtype.from_pretrained(
+    'microsoft/deberta-v3-base',
+    department_type_encoders=department_type_encoders,
+    department_subtype_encoders=department_subtype_encoders
+)
 
 # Define training arguments
 training_args = TrainingArguments(
@@ -227,11 +195,10 @@ training_args = TrainingArguments(
     weight_decay=0.01,
     logging_dir='./logs',
     logging_steps=10,
-    eval_strategy="steps",  # Updated parameter name
+    evaluation_strategy="steps",
     eval_steps=500,
     save_steps=1000,
     load_best_model_at_end=True,
-    fp16=torch.cuda.is_available()
 )
 
 def custom_data_collator(features):
@@ -246,30 +213,23 @@ def custom_data_collator(features):
     return batch
 
 def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    type_logits, subtype_logits = logits  # Unpack the logits tuple
-    type_labels, subtype_labels = labels  # Unpack the labels tuple
-
-    # Convert tensors to numpy arrays if they aren't already
-    type_logits = type_logits.detach().cpu().numpy() if isinstance(type_logits, torch.Tensor) else type_logits
-    subtype_logits = subtype_logits.detach().cpu().numpy() if isinstance(subtype_logits, torch.Tensor) else subtype_logits
-    type_labels = type_labels.detach().cpu().numpy() if isinstance(type_labels, torch.Tensor) else type_labels
-    subtype_labels = subtype_labels.detach().cpu().numpy() if isinstance(subtype_labels, torch.Tensor) else subtype_labels
-
-    # Compute accuracies
+    logits, labels = eval_pred.predictions, eval_pred.label_ids
+    type_logits, all_subtype_logits = logits
+    type_labels, subtype_labels = labels
+    
     type_preds = np.argmax(type_logits, axis=1)
     type_accuracy = (type_preds == type_labels).mean()
-
-    subtype_preds = np.argmax(subtype_logits, axis=1)
+    
+    subtype_preds = np.argmax(all_subtype_logits, axis=1)
     subtype_accuracy = (subtype_preds == subtype_labels).mean()
-
+    
     return {
         'type_accuracy': type_accuracy,
         'subtype_accuracy': subtype_accuracy,
         'overall_accuracy': (type_accuracy + subtype_accuracy) / 2
     }
 
-# Initialize the trainer
+# Initialize trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -280,30 +240,85 @@ trainer = Trainer(
     data_collator=custom_data_collator
 )
 
-# Check if there's a checkpoint
-last_checkpoint = None
-if os.path.isdir(training_args.output_dir):
-    last_checkpoint = get_last_checkpoint(training_args.output_dir)
+# Start training
+trainer.train()
 
-# Start or resume training
-if last_checkpoint is not None:
-    print(f"Resuming training from checkpoint: {last_checkpoint}")
-    trainer.train(resume_from_checkpoint=last_checkpoint)
-else:
-    print("Starting training from scratch")
-    trainer.train()
-
-# Save the final model using custom save_pretrained method
-model.save_pretrained('./final_model')
+# Save the final model
+trainer.save_model('./final_model')
 
 # Save the tokenizer
 tokenizer.save_pretrained('./final_model')
 
-# Save the type encoder and department_subtype_hierarchies
-encoder_dir = os.path.join('./final_model', 'encoders')
+encoder_dir = './final_model/encoders'
 os.makedirs(encoder_dir, exist_ok=True)
-with open(os.path.join(encoder_dir, 'type_encoder.pkl'), 'wb') as f:
-    pickle.dump(type_encoder, f)
 
-with open(os.path.join(encoder_dir, 'department_subtype_hierarchies.pkl'), 'wb') as f:
-    pickle.dump(department_subtype_hierarchies, f)
+with open(os.path.join(encoder_dir, 'department_type_encoders.pkl'), 'wb') as file:
+    pickle.dump(department_type_encoders, file)
+
+with open(os.path.join(encoder_dir, 'department_subtype_encoders.pkl'), 'wb') as file:
+    pickle.dump(department_subtype_encoders, file)
+
+with open(os.path.join(encoder_dir, 'department_subtype_hierarchies.pkl'), 'wb') as file:
+    pickle.dump(department_subtype_hierarchies, file)
+
+# Save the model configuration
+model_config = {
+    'max_types': max(len(encoder.classes_) for encoder in department_type_encoders.values()),
+    'max_subtypes': max(len(encoder.classes_) for encoder in department_subtype_encoders.values())
+}
+
+with open(os.path.join(encoder_dir, 'model_config.pkl'), 'wb') as file:
+    pickle.dump(model_config, file)
+
+def predict_email_type_subtype(email, department, model, tokenizer, subtype_threshold=0.3):
+    input_text = f"{department} [SEP] {email}"
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    inputs['department'] = [department]
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        type_logits = outputs['type_logits']
+        subtype_logits = outputs['subtype_logits']
+        
+        dept_type_encoder = model.department_type_encoders[department]
+        dept_subtype_encoder = model.department_subtype_encoders[department]
+        
+        valid_type_count = len(dept_type_encoder.classes_)
+        valid_subtype_count = len(dept_subtype_encoder.classes_)
+        
+        dept_type_logits = type_logits[0, :valid_type_count]
+        dept_subtype_logits = subtype_logits[0, :valid_subtype_count]
+        
+        type_probs = torch.nn.functional.softmax(dept_type_logits, dim=0)
+        type_pred = torch.argmax(type_probs).item()
+        predicted_type = dept_type_encoder.inverse_transform([type_pred])[0]
+        
+        subtype_probs = torch.nn.functional.softmax(dept_subtype_logits, dim=0)
+        max_subtype_prob = torch.max(subtype_probs).item()
+        subtype_pred = torch.argmax(subtype_probs).item()
+        
+        if max_subtype_prob >= subtype_threshold:
+            predicted_subtype = dept_subtype_encoder.inverse_transform([subtype_pred])[0]
+            valid_subtypes = department_subtype_hierarchies[department][predicted_type]
+            if predicted_subtype not in valid_subtypes:
+                valid_subtype_indices = [dept_subtype_encoder.transform([subtype])[0] for subtype in valid_subtypes]
+                valid_subtype_probs = subtype_probs[valid_subtype_indices]
+                max_valid_subtype_prob = torch.max(valid_subtype_probs).item()
+                
+                if max_valid_subtype_prob >= subtype_threshold:
+                    valid_subtype_pred = valid_subtype_indices[torch.argmax(valid_subtype_probs).item()]
+                    predicted_subtype = dept_subtype_encoder.inverse_transform([valid_subtype_pred])[0]
+                else:
+                    predicted_subtype = None
+        else:
+            predicted_subtype = None
+    
+    return predicted_type, predicted_subtype
+
+# Example usage
+email = "I have a question about my insurance claim..."
+department = "health_insurance"
+predicted_type, predicted_subtype = predict_email_type_subtype(email, department, model, tokenizer, subtype_threshold=0.5)
+print(f"Predicted Type: {predicted_type}")
+print(f"Predicted Subtype: {predicted_subtype if predicted_subtype else 'No confident subtype prediction'}")
